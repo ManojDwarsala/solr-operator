@@ -200,10 +200,23 @@ func pickPodsToUpdate(cloud *solr.SolrCloud, outOfDatePods []corev1.Pod, cluster
 					reason = "Pod's Solr Node is not live, therefore it is safe to take down."
 				} else {
 					for shard, additionalReplicaCount := range nodeContent.totalReplicasPerShard {
-						// If all of the replicas for a shard on the node are down, then this is safe to kill.
+						// If all of the replicas for a shard on the node are down, then killing this pod does not
+						// reduce the number of replicas currently serving the shard.
 						// Currently this logic lets replicas in recovery continue recovery rather than killing them.
 						if additionalReplicaCount == nodeContent.downReplicasPerShard[shard] {
-							continue
+							// However, that is only safe if the shard is still served by a replica elsewhere.
+							// If it is not, this pod holds the shard's only path back to availability: a "down"
+							// replica on a live node is expected to recover on its own, and restarting the pod
+							// throws that recovery away and extends a full-shard outage.
+							// A "recovery_failed" replica will not recover on its own, so it is still killed in
+							// order to let the rolling update make progress.
+							if totalShardReplicas[shard]-shardReplicasNotActive[shard] > 0 ||
+								nodeContent.recoveryFailedReplicasPerShard[shard] == additionalReplicaCount {
+								continue
+							}
+							reason = fmt.Sprintf("Shard %s has no active replica and this pod holds its only recovering replica, taking it down would leave the shard with no replica able to recover", shard)
+							isSafeToUpdate = false
+							break
 						}
 
 						notActiveReplicaCount, _ := shardReplicasNotActive[shard]
@@ -347,14 +360,15 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 		delete(managedSolrNodeNames, nodeName)
 		if !hasValue {
 			contents = &SolrNodeContents{
-				nodeName:               nodeName,
-				leaders:                0,
-				replicas:               0,
-				totalReplicasPerShard:  map[string]int{},
-				activeReplicasPerShard: map[string]int{},
-				downReplicasPerShard:   map[string]int{},
-				overseerLeader:         false,
-				live:                   true,
+				nodeName:                       nodeName,
+				leaders:                        0,
+				replicas:                       0,
+				totalReplicasPerShard:          map[string]int{},
+				activeReplicasPerShard:         map[string]int{},
+				downReplicasPerShard:           map[string]int{},
+				recoveryFailedReplicasPerShard: map[string]int{},
+				overseerLeader:                 false,
+				live:                           true,
 			}
 		} else {
 			contents.live = true
@@ -370,14 +384,15 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 				contents, hasValue := nodeContents[replica.NodeName]
 				if !hasValue {
 					contents = &SolrNodeContents{
-						nodeName:               replica.NodeName,
-						leaders:                0,
-						replicas:               0,
-						totalReplicasPerShard:  map[string]int{},
-						activeReplicasPerShard: map[string]int{},
-						downReplicasPerShard:   map[string]int{},
-						overseerLeader:         false,
-						live:                   false,
+						nodeName:                       replica.NodeName,
+						leaders:                        0,
+						replicas:                       0,
+						totalReplicasPerShard:          map[string]int{},
+						activeReplicasPerShard:         map[string]int{},
+						downReplicasPerShard:           map[string]int{},
+						recoveryFailedReplicasPerShard: map[string]int{},
+						overseerLeader:                 false,
+						live:                           false,
 					}
 				}
 				if replica.Leader {
@@ -396,6 +411,10 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 				// Keep track of how many of the replicas of this shard are in a down state (down or recovery_failed)
 				if replica.State == solr_api.ReplicaDown || replica.State == solr_api.ReplicaRecoveryFailed {
 					contents.downReplicasPerShard[uniqueShard] += 1
+					// Track recovery_failed separately, it is the only "down" state that will not recover on its own.
+					if replica.State == solr_api.ReplicaRecoveryFailed {
+						contents.recoveryFailedReplicasPerShard[uniqueShard] += 1
+					}
 				} else {
 					contents.notDownReplicas += 1
 				}
@@ -409,13 +428,14 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 		contents, hasValue := nodeContents[overseerLeader]
 		if !hasValue {
 			contents = &SolrNodeContents{
-				nodeName:               overseerLeader,
-				leaders:                0,
-				totalReplicasPerShard:  map[string]int{},
-				activeReplicasPerShard: map[string]int{},
-				downReplicasPerShard:   map[string]int{},
-				overseerLeader:         true,
-				live:                   false,
+				nodeName:                       overseerLeader,
+				leaders:                        0,
+				totalReplicasPerShard:          map[string]int{},
+				activeReplicasPerShard:         map[string]int{},
+				downReplicasPerShard:           map[string]int{},
+				recoveryFailedReplicasPerShard: map[string]int{},
+				overseerLeader:                 true,
+				live:                           false,
 			}
 		} else {
 			contents.overseerLeader = true
@@ -448,6 +468,11 @@ type SolrNodeContents struct {
 
 	// The number of down (or recovery_failed) replicas in this Solr Node, grouped by each unique shard (collection+shard)
 	downReplicasPerShard map[string]int
+
+	// The number of recovery_failed replicas in this Solr Node, grouped by each unique shard (collection+shard).
+	// This is a subset of downReplicasPerShard. A "down" replica is expected to recover on its own, whereas a
+	// "recovery_failed" replica has given up and requires a restart to make progress.
+	recoveryFailedReplicasPerShard map[string]int
 
 	// Whether this SolrNode is the overseer leader in the SolrCloud
 	overseerLeader bool
