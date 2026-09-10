@@ -299,21 +299,21 @@ func TestFindSolrNodeContents(t *testing.T) {
 	overseerLeader := "foo-solrcloud-0.foo-solrcloud-headless.default:2000_solr"
 
 	// Test allManagedPodsLive when true
-	_, _, _, allManagedPodsLive := findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{
+	_, _, _, _, allManagedPodsLive := findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{
 		"foo-solrcloud-2.foo-solrcloud-headless.default:2000_solr": true,
 		"foo-solrcloud-6.foo-solrcloud-headless.default:2000_solr": true,
 	})
 	assert.True(t, allManagedPodsLive, "allManagedPodsLive should be true, because both managed pods are live in cluster status")
 
 	// Test allManagedPodsLive when false
-	_, _, _, allManagedPodsLive = findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{
+	_, _, _, _, allManagedPodsLive = findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{
 		"foo-solrcloud-2.foo-solrcloud-headless.default:2000_solr": true,
 		"foo-solrcloud-6.foo-solrcloud-headless.default:2000_solr": true,
 		"foo-solrcloud-4.foo-solrcloud-headless.default:2000_solr": true,
 	})
 	assert.False(t, allManagedPodsLive, "allManagedPodsLive should be false, because there is a managed pod that is not live")
 
-	nodeContents, totalShardReplicas, shardReplicasNotActive, _ := findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{})
+	nodeContents, totalShardReplicas, shardReplicasNotActive, _, _ := findSolrNodeContents(testRecoveringClusterStatus, overseerLeader, map[string]bool{})
 
 	expectedNodeContents := map[string]*SolrNodeContents{
 		"foo-solrcloud-0.foo-solrcloud-headless.default:2000_solr": {

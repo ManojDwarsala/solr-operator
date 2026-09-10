@@ -215,6 +215,31 @@ func TestPickPodsToUpgradeShardAvailability(t *testing.T) {
 			explanation: "Pod 1 is not live and is taken down regardless, but pod 2 still holds the shard's only " +
 				"recovering replica and is protected.",
 		},
+		{
+			name: "a shard that is down on live nodes is restarted rather than stalling the update forever",
+			replicaStates: map[int]solr_api.SolrReplicaState{
+				1: solr_api.ReplicaDown,
+				2: solr_api.ReplicaDown,
+			},
+			notLive:      map[int]bool{},
+			expectedPods: []string{"foo-solrcloud-2"},
+			explanation: "Every node is live and no replica is recovering, so nothing is going to move these " +
+				"replicas out of \"down\" on its own. Refusing both pods would leave the rolling update retrying " +
+				"forever with the shard still unavailable, so one pod is taken down. The other is then protected, " +
+				"because the pod being taken down is now on its way back and counts as in transition.",
+		},
+		{
+			name: "a recovering replica elsewhere is waited for rather than restarting the down replica",
+			replicaStates: map[int]solr_api.SolrReplicaState{
+				1: solr_api.ReplicaRecovering,
+				2: solr_api.ReplicaDown,
+			},
+			notLive:      map[int]bool{},
+			expectedPods: []string{},
+			explanation: "Pod 1's replica is actively recovering and is expected to become active on its own, so " +
+				"pod 2 is protected rather than restarted. Pod 1 is held back by the existing availability budget. " +
+				"This is a bounded wait on a recovery in progress, not a stall.",
+		},
 	}
 
 	for _, test := range tests {

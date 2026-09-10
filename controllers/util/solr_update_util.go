@@ -92,8 +92,8 @@ func scheduleNextRestartWithTime(restartSchedule string, podTemplateAnnotations 
 // If an out of date pod has a solr container that is not started, it should be accounted for in outOfDatePodsNotStartedCount not outOfDatePods.
 //
 // TODO:
-//  - Think about caching this for ~250 ms? Not a huge need to send these requests milliseconds apart.
-//    - Might be too much complexity for very little gain.
+//   - Think about caching this for ~250 ms? Not a huge need to send these requests milliseconds apart.
+//   - Might be too much complexity for very little gain.
 func DeterminePodsSafeToUpdate(ctx context.Context, cloud *solr.SolrCloud, outOfDatePods []corev1.Pod, readyPods int, availableUpdatedPodCount int, outOfDatePodsNotStartedCount int, logger logr.Logger) (podsToUpdate []corev1.Pod, retryLater bool) {
 	// Before fetching the cluster state, be sure that there is room to update at least 1 pod
 	maxPodsUnavailable, unavailableUpdatedPodCount, maxPodsToUpdate := calculateMaxPodsToUpdate(cloud, len(outOfDatePods), outOfDatePodsNotStartedCount, availableUpdatedPodCount)
@@ -155,7 +155,7 @@ func calculateMaxPodsToUpdate(cloud *solr.SolrCloud, outOfDatePodCount int, outO
 
 func pickPodsToUpdate(cloud *solr.SolrCloud, outOfDatePods []corev1.Pod, clusterStatus solr_api.SolrClusterStatus,
 	overseer string, maxPodsToUpdate int, logger logr.Logger) (podsToUpdate []corev1.Pod) {
-	nodeContents, totalShardReplicas, shardReplicasNotActive, allManagedPodsLive := findSolrNodeContents(clusterStatus, overseer, GetAllManagedSolrNodeNames(cloud))
+	nodeContents, totalShardReplicas, shardReplicasNotActive, shardReplicasInTransition, allManagedPodsLive := findSolrNodeContents(clusterStatus, overseer, GetAllManagedSolrNodeNames(cloud))
 	sortNodePodsBySafety(outOfDatePods, nodeContents, cloud)
 
 	updateOptions := cloud.Spec.UpdateStrategy.ManagedUpdateOptions
@@ -205,16 +205,23 @@ func pickPodsToUpdate(cloud *solr.SolrCloud, outOfDatePods []corev1.Pod, cluster
 						// Currently this logic lets replicas in recovery continue recovery rather than killing them.
 						if additionalReplicaCount == nodeContent.downReplicasPerShard[shard] {
 							// However, that is only safe if the shard is still served by a replica elsewhere.
-							// If it is not, this pod holds the shard's only path back to availability: a "down"
-							// replica on a live node is expected to recover on its own, and restarting the pod
-							// throws that recovery away and extends a full-shard outage.
-							// A "recovery_failed" replica will not recover on its own, so it is still killed in
-							// order to let the rolling update make progress.
+							// If it is not, this pod may hold the shard's only path back to availability, and
+							// restarting it throws away a recovery that is already underway.
+							//
+							// The pod is only worth protecting while the shard has a replica in transition, meaning
+							// a replica that will change state on its own: one whose node is not live and is
+							// therefore on its way back, or one that is actively recovering. If nothing is in
+							// transition then no amount of waiting will bring the shard back, and refusing the pod
+							// would stall the rolling update forever, so it is taken down instead.
+							//
+							// A "recovery_failed" replica is likewise not worth protecting, since that state does
+							// not resolve on its own and a restart is the only thing that can clear it.
 							if totalShardReplicas[shard]-shardReplicasNotActive[shard] > 0 ||
-								nodeContent.recoveryFailedReplicasPerShard[shard] == additionalReplicaCount {
+								nodeContent.recoveryFailedReplicasPerShard[shard] == additionalReplicaCount ||
+								shardReplicasInTransition[shard] == 0 {
 								continue
 							}
-							reason = fmt.Sprintf("Shard %s has no active replica and this pod holds its only recovering replica, taking it down would leave the shard with no replica able to recover", shard)
+							reason = fmt.Sprintf("Shard %s has no active replica and this pod holds a replica that is still able to recover, taking it down would leave the shard with no replica able to recover", shard)
 							isSafeToUpdate = false
 							break
 						}
@@ -246,6 +253,12 @@ func pickPodsToUpdate(cloud *solr.SolrCloud, outOfDatePods []corev1.Pod, cluster
 			if isInClusterState && nodeContent.live {
 				for shard, additionalReplicaCount := range nodeContent.activeReplicasPerShard {
 					shardReplicasNotActive[shard] += additionalReplicaCount
+				}
+				// Once this pod is deleted its node is no longer live, so every replica on it is on its way back
+				// and counts as "in transition" for the pods considered after this one. This is what stops a shard
+				// whose replicas are all down from having every one of its pods taken down in the same batch.
+				for shard, additionalReplicaCount := range nodeContent.totalReplicasPerShard {
+					shardReplicasInTransition[shard] += additionalReplicaCount
 				}
 			}
 			logger.Info("Pod killed for update.", "pod", pod.Name, "reason", reason)
@@ -346,14 +359,17 @@ func ResolveMaxShardReplicasUnavailable(maxShardReplicasUnavailable *intstr.IntO
 /*
 findSolrNodeContents will take a cluster and overseerLeader response from the SolrCloud Collections API, and aggregate the information.
 This aggregated info is returned as:
-	- A map from Solr nodeName to SolrNodeContents, with the information from the clusterState and overseerLeader
-    - A map from unique shard name (collection+shard) to the count of replicas that are not active for that shard.
-      - If a node is not live, then all shards that live on that node will be considered "not active"
+  - A map from Solr nodeName to SolrNodeContents, with the information from the clusterState and overseerLeader
+  - A map from unique shard name (collection+shard) to the count of replicas that are not active for that shard.
+  - If a node is not live, then all shards that live on that node will be considered "not active"
+  - A map from unique shard name (collection+shard) to the count of replicas that are expected to change state
+    on their own, without the operator restarting anything. See shardReplicasInTransition below.
 */
-func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader string, managedSolrNodeNames map[string]bool) (nodeContents map[string]*SolrNodeContents, totalShardReplicas map[string]int, shardReplicasNotActive map[string]int, allManagedPodsLive bool) {
+func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader string, managedSolrNodeNames map[string]bool) (nodeContents map[string]*SolrNodeContents, totalShardReplicas map[string]int, shardReplicasNotActive map[string]int, shardReplicasInTransition map[string]int, allManagedPodsLive bool) {
 	nodeContents = make(map[string]*SolrNodeContents, 0)
 	totalShardReplicas = make(map[string]int, 0)
 	shardReplicasNotActive = make(map[string]int, 0)
+	shardReplicasInTransition = make(map[string]int, 0)
 	// Update the info for each "live" node.
 	for _, nodeName := range cluster.LiveNodes {
 		contents, hasValue := nodeContents[nodeName]
@@ -405,6 +421,13 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 				if !(replica.State == solr_api.ReplicaActive && contents.live) {
 					shardReplicasNotActive[uniqueShard] += 1
 				}
+				// A replica is "in transition" if it is expected to change state without the operator restarting
+				// anything: either its node is not live, so the node is on its way back and will re-publish the
+				// replica's state, or the replica is actively recovering. A replica that is "down" on a live node
+				// is not in transition, because nothing is guaranteed to move it out of that state.
+				if !contents.live || replica.State == solr_api.ReplicaRecovering {
+					shardReplicasInTransition[uniqueShard] += 1
+				}
 				if replica.State == solr_api.ReplicaActive {
 					contents.activeReplicasPerShard[uniqueShard] += 1
 				}
@@ -442,7 +465,7 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 		}
 		nodeContents[overseerLeader] = contents
 	}
-	return nodeContents, totalShardReplicas, shardReplicasNotActive, len(managedSolrNodeNames) == 0
+	return nodeContents, totalShardReplicas, shardReplicasNotActive, shardReplicasInTransition, len(managedSolrNodeNames) == 0
 }
 
 type SolrNodeContents struct {
