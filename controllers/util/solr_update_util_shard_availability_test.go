@@ -229,6 +229,18 @@ func TestPickPodsToUpgradeShardAvailability(t *testing.T) {
 				"because the pod being taken down is now on its way back and counts as in transition.",
 		},
 		{
+			name: "an orphaned replica on a node this SolrCloud no longer manages does not protect the shard",
+			replicaStates: map[int]solr_api.SolrReplicaState{
+				1: solr_api.ReplicaDown,
+				9: solr_api.ReplicaActive,
+			},
+			notLive:      map[int]bool{},
+			expectedPods: []string{"foo-solrcloud-1", "foo-solrcloud-2"},
+			explanation: "Pod 9 is outside this SolrCloud's pod range, so its node is not live and is never coming " +
+				"back. Treating it as in transition would protect pod 1 forever, so it is excluded and pod 1 is " +
+				"taken down.",
+		},
+		{
 			name: "a recovering replica elsewhere is waited for rather than restarting the down replica",
 			replicaStates: map[int]solr_api.SolrReplicaState{
 				1: solr_api.ReplicaRecovering,

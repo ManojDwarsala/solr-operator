@@ -422,10 +422,17 @@ func findSolrNodeContents(cluster solr_api.SolrClusterStatus, overseerLeader str
 					shardReplicasNotActive[uniqueShard] += 1
 				}
 				// A replica is "in transition" if it is expected to change state without the operator restarting
-				// anything: either its node is not live, so the node is on its way back and will re-publish the
-				// replica's state, or the replica is actively recovering. A replica that is "down" on a live node
-				// is not in transition, because nothing is guaranteed to move it out of that state.
-				if !contents.live || replica.State == solr_api.ReplicaRecovering {
+				// anything: either its node is not live but is a pod this SolrCloud still manages, so the node is
+				// on its way back and will re-publish the replica's state, or the replica is actively recovering.
+				// A replica that is "down" on a live node is not in transition, because nothing is guaranteed to
+				// move it out of that state.
+				// Nodes that are not live and are no longer managed by this SolrCloud are deliberately excluded:
+				// an orphaned replica left behind on a decommissioned node is never coming back, so counting it
+				// would protect the shard forever.
+				// managedSolrNodeNames has already had every live node removed above, so a node found in it here
+				// is one that this SolrCloud expects to exist but that is currently not live.
+				_, nodeIsManagedAndNotLive := managedSolrNodeNames[replica.NodeName]
+				if (!contents.live && nodeIsManagedAndNotLive) || replica.State == solr_api.ReplicaRecovering {
 					shardReplicasInTransition[uniqueShard] += 1
 				}
 				if replica.State == solr_api.ReplicaActive {
